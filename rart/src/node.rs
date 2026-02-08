@@ -1,10 +1,13 @@
 use crate::mapping::direct_mapping::DirectMapping;
+use crate::mapping::direct_mapping::DirectMappingIntoIter;
 use crate::mapping::direct_mapping::DirectMappingIter;
 use crate::mapping::indexed_mapping::IndexedMapping;
+use crate::mapping::indexed_mapping::IndexedMappingIntoIter;
 use crate::mapping::indexed_mapping::IndexedMappingIter;
 
 use crate::mapping::NodeMapping;
 use crate::mapping::sorted_keyed_mapping::SortedKeyedMapping;
+use crate::mapping::sorted_keyed_mapping::SortedKeyedMappingIntoIter;
 use crate::mapping::sorted_keyed_mapping::SortedKeyedMappingIter;
 use crate::partials::Partial;
 use crate::utils::bitset::Bitset64;
@@ -66,6 +69,42 @@ impl<'a, P: Partial, V> Iterator for NodeIter<'a, P, V> {
         }
     }
 }
+
+/// Owned iterator over child nodes, consuming the parent node.
+/// Used by merge operations to take ownership of children from a node.
+pub enum IntoChildrenIter<P: Partial, V> {
+    Node4(SortedKeyedMappingIntoIter<DefaultNode<P, V>, 4>),
+    Node16(SortedKeyedMappingIntoIter<DefaultNode<P, V>, 16>),
+    Node48(IndexedMappingIntoIter<DefaultNode<P, V>, 48, Bitset64<1>>),
+    Node256(DirectMappingIntoIter<DefaultNode<P, V>>),
+    Empty,
+}
+
+impl<P: Partial, V> Iterator for IntoChildrenIter<P, V> {
+    type Item = (u8, DefaultNode<P, V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            IntoChildrenIter::Node4(iter) => iter.next(),
+            IntoChildrenIter::Node16(iter) => iter.next(),
+            IntoChildrenIter::Node48(iter) => iter.next(),
+            IntoChildrenIter::Node256(iter) => iter.next(),
+            IntoChildrenIter::Empty => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            IntoChildrenIter::Node4(iter) => iter.size_hint(),
+            IntoChildrenIter::Node16(iter) => iter.size_hint(),
+            IntoChildrenIter::Node48(iter) => iter.size_hint(),
+            IntoChildrenIter::Node256(iter) => iter.size_hint(),
+            IntoChildrenIter::Empty => (0, Some(0)),
+        }
+    }
+}
+
+impl<P: Partial, V> ExactSizeIterator for IntoChildrenIter<P, V> {}
 
 impl<P: Partial, V> Node<P, V> for DefaultNode<P, V> {
     #[inline]
@@ -326,6 +365,27 @@ impl<P: Partial, V> DefaultNode<P, V> {
             Content::Leaf(_) => NodeIter::Empty,
         }
     }
+
+    /// Consume this node and return an iterator over its children.
+    /// Returns an empty iterator for leaf nodes.
+    pub fn into_children(self) -> IntoChildrenIter<P, V> {
+        match self.content {
+            Content::Node4(mapping) => IntoChildrenIter::Node4(mapping.into_iter()),
+            Content::Node16(mapping) => IntoChildrenIter::Node16(mapping.into_iter()),
+            Content::Node48(mapping) => IntoChildrenIter::Node48(mapping.into_iter()),
+            Content::Node256(mapping) => IntoChildrenIter::Node256(mapping.into_iter()),
+            Content::Leaf(_) => IntoChildrenIter::Empty,
+        }
+    }
+
+    /// Take ownership of the value from a leaf node.
+    /// Returns None for inner nodes.
+    pub fn into_value(self) -> Option<V> {
+        match self.content {
+            Content::Leaf(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -456,5 +516,126 @@ mod tests {
         for i in 48..=255 {
             debug_assert_eq!(*n256.seek_child(i).unwrap().value().unwrap(), i);
         }
+    }
+
+    #[test]
+    fn test_into_value_leaf() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let leaf = DefaultNode::new_leaf(test_key, 42);
+        assert_eq!(leaf.into_value(), Some(42));
+    }
+
+    #[test]
+    fn test_into_value_inner_returns_none() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let inner = DefaultNode::<ArrPartial<16>, i32>::new_inner(test_key);
+        assert_eq!(inner.into_value(), None);
+    }
+
+    #[test]
+    fn test_into_children_leaf_returns_empty() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let leaf = DefaultNode::new_leaf(test_key, 42);
+        let children: Vec<_> = leaf.into_children().collect();
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn test_into_children_node4() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let mut n4 = DefaultNode::new_4(test_key.clone());
+
+        n4.add_child(5, DefaultNode::new_leaf(test_key.clone(), 1));
+        n4.add_child(3, DefaultNode::new_leaf(test_key.clone(), 2));
+        n4.add_child(7, DefaultNode::new_leaf(test_key.clone(), 3));
+
+        let children: Vec<_> = n4.into_children().collect();
+        assert_eq!(children.len(), 3);
+
+        // SortedKeyedMapping keeps children sorted by key.
+        assert_eq!(children[0].0, 3);
+        assert_eq!(*children[0].1.value().unwrap(), 2);
+        assert_eq!(children[1].0, 5);
+        assert_eq!(*children[1].1.value().unwrap(), 1);
+        assert_eq!(children[2].0, 7);
+        assert_eq!(*children[2].1.value().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_into_children_node16() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let mut n16 = DefaultNode::new_16(test_key.clone());
+
+        for i in 0..10 {
+            n16.add_child(i * 2, DefaultNode::new_leaf(test_key.clone(), i as i32));
+        }
+
+        let children: Vec<_> = n16.into_children().collect();
+        assert_eq!(children.len(), 10);
+
+        // Verify sorted order and values.
+        for (idx, (key, child)) in children.iter().enumerate() {
+            assert_eq!(*key, (idx * 2) as u8);
+            assert_eq!(*child.value().unwrap(), idx as i32);
+        }
+    }
+
+    #[test]
+    fn test_into_children_node48() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let mut n48 = DefaultNode::new_48(test_key.clone());
+
+        let keys_to_add = [10u8, 5, 20, 15, 25];
+        for (idx, &k) in keys_to_add.iter().enumerate() {
+            n48.add_child(k, DefaultNode::new_leaf(test_key.clone(), idx as i32));
+        }
+
+        let children: Vec<_> = n48.into_children().collect();
+        assert_eq!(children.len(), 5);
+
+        // IndexedMapping iterates in key order.
+        let keys: Vec<u8> = children.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![5, 10, 15, 20, 25]);
+    }
+
+    #[test]
+    fn test_into_children_node256() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let mut n256 = DefaultNode::new_256(test_key.clone());
+
+        let keys_to_add = [200u8, 50, 100, 150, 0];
+        for (idx, &k) in keys_to_add.iter().enumerate() {
+            n256.add_child(k, DefaultNode::new_leaf(test_key.clone(), idx as i32));
+        }
+
+        let children: Vec<_> = n256.into_children().collect();
+        assert_eq!(children.len(), 5);
+
+        // DirectMapping iterates in key order.
+        let keys: Vec<u8> = children.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![0, 50, 100, 150, 200]);
+    }
+
+    #[test]
+    fn test_into_children_size_hint() {
+        let test_key: ArrPartial<16> = ArrPartial::key("abc".as_bytes());
+        let mut n4 = DefaultNode::new_4(test_key.clone());
+
+        n4.add_child(1, DefaultNode::new_leaf(test_key.clone(), 1));
+        n4.add_child(2, DefaultNode::new_leaf(test_key.clone(), 2));
+        n4.add_child(3, DefaultNode::new_leaf(test_key.clone(), 3));
+
+        let mut iter = n4.into_children();
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+        assert_eq!(iter.len(), 3);
+
+        iter.next();
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+        assert_eq!(iter.len(), 2);
+
+        iter.next();
+        iter.next();
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.len(), 0);
     }
 }

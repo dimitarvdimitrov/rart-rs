@@ -257,6 +257,125 @@ fn gen_cached_keys(
     keys
 }
 
+/// Merge two 10k-element trees with no overlapping keys.
+pub fn bench_merge_disjoint_10k(c: &mut Criterion) {
+    c.bench_function("merge_disjoint_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                // tree1 gets even keys, tree2 gets odd keys.
+                for i in 0..10_000u64 {
+                    tree1.insert(i * 2, i * 2);
+                    tree2.insert(i * 2 + 1, i * 2 + 1);
+                }
+                (tree1, tree2)
+            },
+            |(tree1, tree2)| std::hint::black_box(tree1.merge(tree2)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Merge two 10k-element trees with 50% key overlap.
+pub fn bench_merge_50pct_overlap_10k(c: &mut Criterion) {
+    c.bench_function("merge_50pct_overlap_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                // tree1 gets [0..10k), tree2 gets [5k..15k). Overlap is [5k..10k).
+                for i in 0..10_000u64 {
+                    tree1.insert(i, i);
+                    tree2.insert(i + 5_000, i + 5_000);
+                }
+                (tree1, tree2)
+            },
+            |(tree1, tree2)| std::hint::black_box(tree1.merge(tree2)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Merge two sequential ranges: [0..10k] with [10k..20k].
+pub fn bench_merge_sequential_ranges(c: &mut Criterion) {
+    c.bench_function("merge_sequential_ranges", |b| {
+        b.iter_batched(
+            || {
+                let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                for i in 0..10_000u64 {
+                    tree1.insert(i, i);
+                    tree2.insert(i + 10_000, i + 10_000);
+                }
+                (tree1, tree2)
+            },
+            |(tree1, tree2)| std::hint::black_box(tree1.merge(tree2)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Naive merge via iterators: iterate both trees and insert into a new tree.
+/// This serves as a baseline to compare against the optimized merge().
+pub fn bench_merge_naive_disjoint_10k(c: &mut Criterion) {
+    c.bench_function("merge_naive_disjoint_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                // Same setup as disjoint: tree1 even, tree2 odd.
+                for i in 0..10_000u64 {
+                    tree1.insert(i * 2, i * 2);
+                    tree2.insert(i * 2 + 1, i * 2 + 1);
+                }
+                (tree1, tree2)
+            },
+            |(tree1, tree2)| {
+                let mut result = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                // Insert all from tree1, then all from tree2 (tree2 wins on conflict).
+                for (k, v) in tree1.iter() {
+                    result.insert_k(&k, *v);
+                }
+                for (k, v) in tree2.iter() {
+                    result.insert_k(&k, *v);
+                }
+                std::hint::black_box(result)
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Naive merge via iterators with 50% overlap.
+pub fn bench_merge_naive_50pct_overlap_10k(c: &mut Criterion) {
+    c.bench_function("merge_naive_50pct_overlap_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                // Same setup as 50% overlap: tree1 [0..10k), tree2 [5k..15k).
+                for i in 0..10_000u64 {
+                    tree1.insert(i, i);
+                    tree2.insert(i + 5_000, i + 5_000);
+                }
+                (tree1, tree2)
+            },
+            |(tree1, tree2)| {
+                let mut result = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+                for (k, v) in tree1.iter() {
+                    result.insert_k(&k, *v);
+                }
+                for (k, v) in tree2.iter() {
+                    result.insert_k(&k, *v);
+                }
+                std::hint::black_box(result)
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
 criterion_group!(
     name = rand_benches;
     config = criterion_config();
@@ -267,4 +386,9 @@ criterion_group!(
     config = criterion_config();
     targets = seq_get, seq_insert, seq_remove
 );
-criterion_main!(seq_benches, rand_benches);
+criterion_group!(
+    name = merge_benches;
+    config = criterion_config();
+    targets = bench_merge_disjoint_10k, bench_merge_50pct_overlap_10k, bench_merge_sequential_ranges, bench_merge_naive_disjoint_10k, bench_merge_naive_50pct_overlap_10k
+);
+criterion_main!(seq_benches, rand_benches, merge_benches);

@@ -35,6 +35,7 @@ associative data structures.
 - Cache-friendly memory layout for modern CPU architectures
 - SIMD support for vectorized operations (x86 SSE and ARM NEON)
 - Efficient iteration over key ranges with proper ordering
+- Tree merge with "right wins" conflict resolution
 
 **Best for:** Single-threaded applications.
 
@@ -140,6 +141,29 @@ Typical uses:
 - Policy/config lookup: most specific override wins
 - Autocomplete/search narrowing: iterate all keys under a typed prefix
 - Prefix cache reuse: find best existing cached prefix before extending
+
+## Tree Merge
+
+Combine two trees with `merge`, which consumes both trees and returns a new one. When both trees
+contain the same key, the value from the right tree wins:
+
+```rust
+use rart::{AdaptiveRadixTree, ArrayKey};
+
+let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+tree1.insert("apple", 1);
+tree1.insert("banana", 2);
+
+let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+tree2.insert("apple", 10);  // Overwrites tree1's "apple"
+tree2.insert("cherry", 3);
+
+let merged = tree1.merge(tree2);
+
+assert_eq!(merged.get("apple"), Some(&10));  // From tree2
+assert_eq!(merged.get("banana"), Some(&2));  // From tree1
+assert_eq!(merged.get("cherry"), Some(&3));  // From tree2
+```
 
 How this differs from standard maps:
 

@@ -38,3 +38,9 @@ name = "versioned_tree_multithread"
 path = "src/versioned_tree_multithread.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "rart_merge"
+path = "src/rart_merge.rs"
+test = false
+doc = false

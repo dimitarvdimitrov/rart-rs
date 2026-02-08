@@ -328,6 +328,39 @@ where
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
+
+    /// Merge another tree into this one, consuming both and returning a new tree.
+    ///
+    /// When both trees contain the same key, the value from `other` is used
+    /// (right-wins semantics, similar to `HashMap::extend`).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use rart::{AdaptiveRadixTree, ArrayKey};
+    ///
+    /// let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+    /// tree1.insert("apple", 1);
+    /// tree1.insert("banana", 2);
+    ///
+    /// let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+    /// tree2.insert("apple", 10);  // Overwrites tree1's "apple"
+    /// tree2.insert("cherry", 3);
+    ///
+    /// let merged = tree1.merge(tree2);
+    ///
+    /// assert_eq!(merged.get("apple"), Some(&10));  // From tree2
+    /// assert_eq!(merged.get("banana"), Some(&2));  // From tree1
+    /// assert_eq!(merged.get("cherry"), Some(&3));  // From tree2
+    /// ```
+    pub fn merge(self, other: Self) -> Self {
+        match (self.root, other.root) {
+            (None, None) => Self::new(),
+            (Some(root), None) => Self::from_root(root),
+            (None, Some(root)) => Self::from_root(root),
+            (Some(root1), Some(root2)) => Self::from_root(Self::merge_nodes(root1, root2)),
+        }
+    }
 }
 
 impl<KeyType, ValueType> TreeStatsTrait for AdaptiveRadixTree<KeyType, ValueType>
@@ -372,6 +405,218 @@ impl<KeyType, ValueType> AdaptiveRadixTree<KeyType, ValueType>
 where
     KeyType: KeyTrait,
 {
+    /// Recursively merge two nodes.
+    ///
+    /// This function handles four cases based on how the prefixes of the two nodes relate:
+    /// 1. Prefixes are identical: merge children or use right-wins for leaves.
+    /// 2. node1's prefix is a prefix of node2's: node1 becomes parent, node2 becomes child.
+    /// 3. node2's prefix is a prefix of node1's: node2 becomes parent, node1 becomes child.
+    /// 4. Prefixes diverge: create new parent with common prefix, both nodes as children.
+    fn merge_nodes(
+        node1: DefaultNode<KeyType::PartialType, ValueType>,
+        node2: DefaultNode<KeyType::PartialType, ValueType>,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        let common_len = node1.prefix.prefix_length_common(&node2.prefix);
+        let p1_len = node1.prefix.len();
+        let p2_len = node2.prefix.len();
+
+        // Case 1: Prefixes are identical.
+        if common_len == p1_len && common_len == p2_len {
+            return Self::merge_same_prefix(node1, node2);
+        }
+
+        // Case 2: node1's prefix is a prefix of node2's prefix.
+        // node1 is the "parent", node2 should be inserted as a child.
+        if common_len == p1_len && p1_len < p2_len {
+            return Self::merge_node1_is_prefix(node1, node2, common_len);
+        }
+
+        // Case 3: node2's prefix is a prefix of node1's prefix.
+        // node2 is the "parent", node1 should be inserted as a child.
+        if common_len == p2_len && p2_len < p1_len {
+            return Self::merge_node2_is_prefix(node1, node2, common_len);
+        }
+
+        // Case 4: Prefixes diverge at some point.
+        Self::merge_divergent(node1, node2, common_len)
+    }
+
+    /// Merge two nodes with identical prefixes.
+    fn merge_same_prefix(
+        node1: DefaultNode<KeyType::PartialType, ValueType>,
+        node2: DefaultNode<KeyType::PartialType, ValueType>,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        match (node1.is_leaf(), node2.is_leaf()) {
+            // Both leaves with same key: node2 wins (right-wins semantics).
+            (true, true) => node2,
+
+            // Due to null terminator handling, a leaf's prefix ends with 0 while an
+            // inner node's prefix does not. If they had "identical" prefixes, prefix
+            // comparison would detect divergence at the null byte. This case should
+            // not occur in a correctly-constructed ART.
+            (true, false) | (false, true) => {
+                unreachable!(
+                    "leaf/inner with identical prefix should not occur due to null terminators"
+                )
+            }
+
+            // Both inner nodes: merge children recursively.
+            (false, false) => {
+                let prefix = node1.prefix.clone();
+                let mut result = DefaultNode::new_inner(prefix);
+
+                // Use a 256-element array to pair up children from both nodes.
+                // Each slot holds (Option<child_from_node1>, Option<child_from_node2>).
+                type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
+                const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
+                    (None, None)
+                }
+                let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
+                    [const { init_pair() }; 256];
+
+                for (k, child) in node1.into_children() {
+                    children[k as usize].0 = Some(child);
+                }
+                for (k, child) in node2.into_children() {
+                    children[k as usize].1 = Some(child);
+                }
+
+                // Merge children at each key.
+                for (k, (c1, c2)) in children.into_iter().enumerate() {
+                    let merged = match (c1, c2) {
+                        (None, None) => continue,
+                        (Some(child), None) | (None, Some(child)) => child,
+                        (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
+                    };
+                    result.add_child(k as u8, merged);
+                }
+
+                result
+            }
+        }
+    }
+
+    /// Merge when node1's prefix is a prefix of node2's prefix.
+    /// node1 becomes the parent, node2 is inserted as a child.
+    fn merge_node1_is_prefix(
+        node1: DefaultNode<KeyType::PartialType, ValueType>,
+        mut node2: DefaultNode<KeyType::PartialType, ValueType>,
+        common_len: usize,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        if node1.is_leaf() {
+            // node1 is a leaf, node2 is inner (since prefixes differ in length).
+            // This means node1 represents a key that is a prefix of keys in node2's subtree.
+            // Due to null terminators, node1's prefix ends with 0. The divergence point
+            // is at the null byte, so this should be handled as divergence, not here.
+            unreachable!(
+                "node1 is leaf but is prefix of node2: should not occur due to null terminators"
+            )
+        }
+
+        // node1 is inner. Truncate node2's prefix and insert it as a child.
+        let child_key = node2.prefix.at(common_len);
+        node2.prefix = node2.prefix.partial_after(common_len);
+
+        // Build the result node with node1's prefix.
+        let mut result = DefaultNode::new_inner(node1.prefix.clone());
+
+        // Collect existing children, potentially merging with node2.
+        type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
+        const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
+            (None, None)
+        }
+        let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
+            [const { init_pair() }; 256];
+
+        for (k, child) in node1.into_children() {
+            children[k as usize].0 = Some(child);
+        }
+        children[child_key as usize].1 = Some(node2);
+
+        for (k, (c1, c2)) in children.into_iter().enumerate() {
+            let merged = match (c1, c2) {
+                (None, None) => continue,
+                (Some(child), None) | (None, Some(child)) => child,
+                (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
+            };
+            result.add_child(k as u8, merged);
+        }
+
+        result
+    }
+
+    /// Merge when node2's prefix is a prefix of node1's prefix.
+    /// node2 becomes the parent, node1 is inserted as a child.
+    fn merge_node2_is_prefix(
+        mut node1: DefaultNode<KeyType::PartialType, ValueType>,
+        node2: DefaultNode<KeyType::PartialType, ValueType>,
+        common_len: usize,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        if node2.is_leaf() {
+            // node2 is a leaf, node1 is inner (since prefixes differ in length).
+            // Due to null terminators, this should not occur.
+            unreachable!(
+                "node2 is leaf but is prefix of node1: should not occur due to null terminators"
+            )
+        }
+
+        // node2 is inner. Truncate node1's prefix and insert it as a child.
+        let child_key = node1.prefix.at(common_len);
+        node1.prefix = node1.prefix.partial_after(common_len);
+
+        // Check if node2 already has a child at this key.
+        let mut result = DefaultNode::new_inner(node2.prefix.clone());
+
+        // Collect existing children, potentially merging with node1.
+        type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
+        const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
+            (None, None)
+        }
+        let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
+            [const { init_pair() }; 256];
+
+        children[child_key as usize].0 = Some(node1);
+        for (k, child) in node2.into_children() {
+            children[k as usize].1 = Some(child);
+        }
+
+        for (k, (c1, c2)) in children.into_iter().enumerate() {
+            let merged = match (c1, c2) {
+                (None, None) => continue,
+                (Some(child), None) | (None, Some(child)) => child,
+                (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
+            };
+            result.add_child(k as u8, merged);
+        }
+
+        result
+    }
+
+    /// Merge two nodes whose prefixes diverge.
+    /// Create a new parent node with the common prefix, and add both nodes as children.
+    fn merge_divergent(
+        mut node1: DefaultNode<KeyType::PartialType, ValueType>,
+        mut node2: DefaultNode<KeyType::PartialType, ValueType>,
+        common_len: usize,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        // Create new parent with the common prefix.
+        let common_prefix = node1.prefix.partial_before(common_len);
+        let mut result = DefaultNode::new_inner(common_prefix);
+
+        // Get the diverging bytes and truncate both nodes' prefixes.
+        let key1 = node1.prefix.at(common_len);
+        let key2 = node2.prefix.at(common_len);
+        node1.prefix = node1.prefix.partial_after(common_len);
+        node2.prefix = node2.prefix.partial_after(common_len);
+
+        // Add both as children. Since prefixes diverged, key1 != key2.
+        debug_assert_ne!(key1, key2, "divergent prefixes should have different keys");
+        result.add_child(key1, node1);
+        result.add_child(key2, node2);
+
+        result
+    }
+
     fn get_iterate<'a>(
         cur_node: &'a DefaultNode<KeyType::PartialType, ValueType>,
         key: &KeyType,
@@ -1247,5 +1492,381 @@ mod tests {
         let btree_values: Vec<u64> = btree.range(start_raw..).map(|(_, v)| *v).collect();
 
         assert_eq!(art_values, btree_values);
+    }
+
+    // ==================== Merge Tests ====================
+
+    #[test]
+    fn test_merge_disjoint_keys() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("apple", 1);
+        tree1.insert("banana", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("cherry", 3);
+        tree2.insert("date", 4);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("apple"), Some(&1));
+        assert_eq!(merged.get("banana"), Some(&2));
+        assert_eq!(merged.get("cherry"), Some(&3));
+        assert_eq!(merged.get("date"), Some(&4));
+        assert_eq!(merged.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_merge_identical_keys() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("apple", 1);
+        tree1.insert("banana", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("apple", 10);
+        tree2.insert("banana", 20);
+
+        let merged = tree1.merge(tree2);
+
+        // Right wins: tree2's values should be used.
+        assert_eq!(merged.get("apple"), Some(&10));
+        assert_eq!(merged.get("banana"), Some(&20));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_partial_overlap() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("apple", 1);
+        tree1.insert("banana", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("apple", 10); // Overwrites.
+        tree2.insert("cherry", 3); // New key.
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("apple"), Some(&10)); // From tree2.
+        assert_eq!(merged.get("banana"), Some(&2)); // From tree1.
+        assert_eq!(merged.get("cherry"), Some(&3)); // From tree2.
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_empty_into_nonempty() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("apple", 1);
+        tree1.insert("banana", 2);
+
+        let tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("apple"), Some(&1));
+        assert_eq!(merged.get("banana"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_nonempty_into_empty() {
+        let tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("apple", 1);
+        tree2.insert("banana", 2);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("apple"), Some(&1));
+        assert_eq!(merged.get("banana"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_both_empty() {
+        let tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        let merged = tree1.merge(tree2);
+
+        assert!(merged.is_empty());
+        assert_eq!(merged.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_merge_single_key_each() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("a", 1);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("b", 2);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("a"), Some(&1));
+        assert_eq!(merged.get("b"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_prefix_keys() {
+        // Keys like "app" and "apple" share a prefix but are different keys.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("app", 1);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("apple", 2);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("app"), Some(&1));
+        assert_eq!(merged.get("apple"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_shared_prefix_different_values() {
+        // Both trees have keys sharing the same prefix structure.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("apple", 1);
+        tree1.insert("application", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("apple", 10); // Overwrite.
+        tree2.insert("apricot", 3); // New key with shared "ap" prefix.
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("apple"), Some(&10)); // tree2 wins.
+        assert_eq!(merged.get("application"), Some(&2)); // From tree1.
+        assert_eq!(merged.get("apricot"), Some(&3)); // From tree2.
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_deep_prefix_overlap() {
+        // Keys with very long shared prefixes.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<32>, i32>::new();
+        tree1.insert("aaaaaaaaaaaaaaa1", 1);
+        tree1.insert("aaaaaaaaaaaaaaa2", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<32>, i32>::new();
+        tree2.insert("aaaaaaaaaaaaaaa1", 10); // Overwrite.
+        tree2.insert("aaaaaaaaaaaaaaa3", 3); // New key with same prefix.
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("aaaaaaaaaaaaaaa1"), Some(&10));
+        assert_eq!(merged.get("aaaaaaaaaaaaaaa2"), Some(&2));
+        assert_eq!(merged.get("aaaaaaaaaaaaaaa3"), Some(&3));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_vector_key_basic() {
+        // Test with VectorKey to verify algorithm works with variable-length keys.
+        let mut tree1 = AdaptiveRadixTree::<VectorKey, i32>::new();
+        tree1.insert_k(&VectorKey::new_from_slice(b"alpha"), 1);
+        tree1.insert_k(&VectorKey::new_from_slice(b"beta"), 2);
+
+        let mut tree2 = AdaptiveRadixTree::<VectorKey, i32>::new();
+        tree2.insert_k(&VectorKey::new_from_slice(b"alpha"), 10); // Overwrite.
+        tree2.insert_k(&VectorKey::new_from_slice(b"gamma"), 3);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(
+            merged.get_k(&VectorKey::new_from_slice(b"alpha")),
+            Some(&10)
+        );
+        assert_eq!(merged.get_k(&VectorKey::new_from_slice(b"beta")), Some(&2));
+        assert_eq!(merged.get_k(&VectorKey::new_from_slice(b"gamma")), Some(&3));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_forces_node_growth() {
+        // Insert enough keys in both trees to force node growth after merge.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        // Insert keys with different first bytes to force node growth.
+        for i in 0u8..10 {
+            let key = format!("{}key", i as char);
+            tree1.insert(key.as_str(), i as i32);
+        }
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        for i in 10u8..20 {
+            let key = format!("{}key", i as char);
+            tree2.insert(key.as_str(), i as i32);
+        }
+
+        let merged = tree1.merge(tree2);
+        assert_eq!(merged.iter().count(), 20);
+
+        // Verify all keys are accessible.
+        for i in 0u8..20 {
+            let key = format!("{}key", i as char);
+            assert_eq!(merged.get(key.as_str()), Some(&(i as i32)));
+        }
+    }
+
+    #[test]
+    fn test_merge_with_node4_and_node16() {
+        // Create trees with different node densities.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("a", 1);
+        tree1.insert("b", 2);
+        tree1.insert("c", 3);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        for c in 'd'..='p' {
+            tree2.insert(c.to_string().as_str(), c as i32);
+        }
+
+        let merged = tree1.merge(tree2);
+        assert_eq!(merged.iter().count(), 3 + 13); // a-c from tree1, d-p from tree2.
+    }
+
+    #[test]
+    fn test_merge_to_node256() {
+        // Create trees that when merged require Node256 (256 children).
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        for i in 0u8..128 {
+            let key = [i, 0];
+            tree1.insert_k(&ArrayKey::<16>::new_from_slice(&key), i as i32);
+        }
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        for i in 128u8..=255 {
+            let key = [i, 0];
+            tree2.insert_k(&ArrayKey::<16>::new_from_slice(&key), i as i32);
+        }
+
+        let merged = tree1.merge(tree2);
+        assert_eq!(merged.iter().count(), 256);
+
+        // Verify all keys.
+        for i in 0u8..=255 {
+            let key = [i, 0];
+            assert_eq!(
+                merged.get_k(&ArrayKey::<16>::new_from_slice(&key)),
+                Some(&(i as i32))
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_iteration_order_is_lexicographic() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("zebra", 1);
+        tree1.insert("apple", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("mango", 3);
+        tree2.insert("banana", 4);
+
+        let merged = tree1.merge(tree2);
+
+        let keys: Vec<_> = merged.iter().map(|(k, _)| k).collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+    }
+
+    #[test]
+    fn test_merge_numeric_keys() {
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert(100u64, 1);
+        tree1.insert(200u64, 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert(100u64, 10); // Overwrite.
+        tree2.insert(300u64, 3);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get(100u64), Some(&10));
+        assert_eq!(merged.get(200u64), Some(&2));
+        assert_eq!(merged.get(300u64), Some(&3));
+    }
+
+    #[test]
+    fn test_merge_seeded_random() {
+        // Property-based test with seeded random data.
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+        const COUNT: usize = 1000;
+        const SPACE: u64 = 5000;
+
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+        let mut map1 = BTreeMap::new();
+        for _ in 0..COUNT {
+            let k = rng.random_range(0..SPACE);
+            let v = rng.random_range(0..u64::MAX);
+            tree1.insert(k, v);
+            map1.insert(k, v);
+        }
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+        let mut map2 = BTreeMap::new();
+        for _ in 0..COUNT {
+            let k = rng.random_range(0..SPACE);
+            let v = rng.random_range(0..u64::MAX);
+            tree2.insert(k, v);
+            map2.insert(k, v);
+        }
+
+        // Compute expected: map2 wins on conflicts.
+        let mut expected = map1.clone();
+        for (k, v) in &map2 {
+            expected.insert(*k, *v);
+        }
+
+        let merged = tree1.merge(tree2);
+
+        // Verify all expected keys are present with correct values.
+        for (k, v) in &expected {
+            assert_eq!(merged.get(*k), Some(v), "Key {} mismatch", k);
+        }
+
+        // Verify count matches.
+        assert_eq!(merged.iter().count(), expected.len());
+
+        // Verify iteration order.
+        let merged_iter: Vec<_> = merged.iter().map(|(k, v)| (k.to_be_u64(), *v)).collect();
+        let expected_iter: Vec<_> = expected.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(merged_iter, expected_iter);
+    }
+
+    #[test]
+    fn test_merge_divergent_prefixes_at_root() {
+        // Two trees whose roots have completely different prefixes.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("aaaa", 1);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("zzzz", 2);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("aaaa"), Some(&1));
+        assert_eq!(merged.get("zzzz"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_one_prefix_of_other_at_root() {
+        // tree1 has a key that's a prefix of tree2's root path.
+        let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree1.insert("abc", 1);
+        tree1.insert("abcdef", 2);
+
+        let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree2.insert("abcd", 3);
+
+        let merged = tree1.merge(tree2);
+
+        assert_eq!(merged.get("abc"), Some(&1));
+        assert_eq!(merged.get("abcd"), Some(&3));
+        assert_eq!(merged.get("abcdef"), Some(&2));
+        assert_eq!(merged.iter().count(), 3);
     }
 }
