@@ -3,9 +3,11 @@
 //! This module contains the main [`AdaptiveRadixTree`] implementation and related
 //! functionality for the RART crate.
 
-use std::cmp::{Ordering, Reverse, min};
-use std::collections::{BTreeMap, BinaryHeap};
+use std::cmp::{Ordering, min};
+use std::collections::BTreeMap;
 use std::ops::RangeBounds;
+
+use crate::utils::loser_tree::{Entry, LoserTree};
 
 use smallvec::SmallVec;
 
@@ -726,11 +728,11 @@ where
 
     /// Merge children from N inner nodes with a conflict resolver.
     ///
-    /// Uses a min-heap for N-way merge-join. Each heap entry tracks the current
-    /// byte from an iterator, allowing O(log N) extraction of the minimum byte
-    /// instead of O(N) linear scan. All child iterators yield `(byte, child)`
-    /// pairs in sorted byte order, so we advance them in lockstep and collect
-    /// children sharing the same byte.
+    /// Uses a loser tree for N-way merge-join. Each entry tracks the current
+    /// byte from an iterator, allowing O(log N) tournament replay after each
+    /// extraction. All child iterators yield `(byte, child)` pairs in sorted
+    /// byte order, so we advance them in lockstep and collect children sharing
+    /// the same byte.
     fn merge_n_children_with<F>(
         nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         f: &mut F,
@@ -744,26 +746,28 @@ where
             .map(|tagged| (tagged.node.into_children().peekable(), tagged.tree_idx))
             .collect();
 
-        // Initialize min-heap with first element from each iterator.
-        // Heap entries: (Reverse(byte), iter_index, tree_idx).
-        let mut heap: BinaryHeap<(Reverse<u8>, usize, usize)> = BinaryHeap::new();
-        for (idx, (iter, tree_idx)) in iters.iter_mut().enumerate() {
-            if let Some((byte, _)) = iter.peek() {
-                heap.push((Reverse(*byte), idx, *tree_idx));
-            }
-        }
+        // Build initial entries from peekable iterators.
+        let entries: Vec<_> = iters
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, (iter, _))| {
+                let value = iter.peek().map(|(byte, _)| *byte);
+                Entry::new(value, idx)
+            })
+            .collect();
 
+        let mut tree = LoserTree::new(entries);
         let mut result = Vec::new();
 
-        while let Some((Reverse(current_byte), _, _)) = heap.peek().copied() {
+        while let Some(entry) = tree.peek_min() {
+            let current_byte = entry.value.unwrap();
+
             // Collect all children at current_byte.
             let mut children: SmallVec<[TaggedNode<_, _>; 16]> = SmallVec::new();
 
-            while let Some(&(Reverse(byte), idx, tree_idx)) = heap.peek() {
-                if byte != current_byte {
-                    break;
-                }
-                heap.pop();
+            while tree.peek_min().map(|e| e.value) == Some(Some(current_byte)) {
+                let idx = tree.winner_idx();
+                let tree_idx = iters[idx].1;
 
                 // Take the child from the iterator.
                 let (_, child) = iters[idx].0.next().unwrap();
@@ -772,10 +776,9 @@ where
                     tree_idx,
                 });
 
-                // Push next element from this iterator if available.
-                if let Some((next_byte, _)) = iters[idx].0.peek() {
-                    heap.push((Reverse(*next_byte), idx, iters[idx].1));
-                }
+                // Advance the winner's iterator and replay the tournament.
+                let next_value = iters[idx].0.peek().map(|(b, _)| *b);
+                tree.replace_winner(next_value);
             }
 
             let max_tree_idx = children.iter().map(|t| t.tree_idx).max().unwrap();
