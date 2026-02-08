@@ -436,9 +436,8 @@ where
     /// Merge multiple trees into one with custom conflict resolution, consuming all inputs.
     ///
     /// When multiple trees contain the same key, the provided resolver function is called
-    /// repeatedly (fold-style, left to right by tree order) to combine values. For example,
-    /// if trees t0, t1, t2 all have the same key with values v0, v1, v2, the result is
-    /// `f(f(v0, v1), v2)`.
+    /// repeatedly (fold-style) to combine values. The order in which values are folded is
+    /// arbitrary, so the resolver should be commutative for deterministic results.
     ///
     /// # Examples
     ///
@@ -649,10 +648,9 @@ where
             .iter()
             .all(|tagged| tagged.node.is_leaf() && tagged.node.prefix.len() == lcp_len);
         if all_same_key_leaves {
-            // Sort by tree_idx to apply resolver left-to-right.
-            let mut sorted: SmallVec<[_; 4]> = nodes.into_iter().collect();
-            sorted.sort_by_key(|t| t.tree_idx);
-            let mut iter = sorted.into_iter();
+            // Fold values in arbitrary order (no sorting by tree_idx).
+            // Callers who need deterministic order should use commutative resolvers.
+            let mut iter = nodes.into_iter();
             let first = iter.next().unwrap();
             let prefix = first.node.prefix.clone();
             let mut acc = first.node.into_value().unwrap();
@@ -2641,13 +2639,12 @@ mod tests {
 
     #[test]
     fn test_merge_all_extension_vs_exact_match_same_key() {
-        // Test right-wins when extension and exact-match have children leading
-        // to the same key.
+        // Test conflict resolution when extension and exact-match have children leading
+        // to the same key. Since merge order is non-deterministic, we verify that
+        // one of the input values is chosen.
         //
         // Tree 0: inner at "a" with child 'b' -> inner with child 'c' -> leaf (key "abc")
         // Tree 1: leaf at "abc"
-        //
-        // The merged result should have "abc" with Tree 1's value (right-wins).
         let mut t0 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
         let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
 
@@ -2656,7 +2653,9 @@ mod tests {
 
         let merged = AdaptiveRadixTree::merge_all(vec![t0, t1]);
 
-        assert_eq!(merged.get("abc"), Some(&1)); // Tree 1 wins.
+        // One of the values wins (order not guaranteed).
+        let val = merged.get("abc").unwrap();
+        assert!(*val == 0 || *val == 1);
         assert_eq!(merged.iter().count(), 1);
 
         // Three-way test with conflict at extension/exact boundary.
@@ -2667,13 +2666,14 @@ mod tests {
         t0.insert("abc", 0);
         t0.insert("abd", 10);
         t1.insert("ab", 1); // Exact match at "ab", extension from t0 at "ab" + 'c'/'d'.
-        t2.insert("abc", 2); // Should win over t0's "abc".
+        t2.insert("abc", 2); // Conflicts with t0's "abc".
 
         let merged = AdaptiveRadixTree::merge_all(vec![t0, t1, t2]);
 
-        assert_eq!(merged.get("ab"), Some(&1));
-        assert_eq!(merged.get("abc"), Some(&2)); // Tree 2 wins over Tree 0.
-        assert_eq!(merged.get("abd"), Some(&10));
+        assert_eq!(merged.get("ab"), Some(&1)); // Only t1 has "ab".
+        let abc_val = merged.get("abc").unwrap();
+        assert!(*abc_val == 0 || *abc_val == 2); // Either t0 or t2 wins.
+        assert_eq!(merged.get("abd"), Some(&10)); // Only t0 has "abd".
         assert_eq!(merged.iter().count(), 3);
     }
 
@@ -2883,21 +2883,20 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_with_fold_order() {
-        // Verify fold semantics: f(f(v0, v1), v2).
-        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, String>::new();
-        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, String>::new();
-        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, String>::new();
+    fn test_merge_all_with_commutative_resolver() {
+        // With unordered fold, use a commutative resolver (sum).
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
 
-        t1.insert("key", "a".to_string());
-        t2.insert("key", "b".to_string());
-        t3.insert("key", "c".to_string());
+        t1.insert("key", 1);
+        t2.insert("key", 2);
+        t3.insert("key", 3);
 
-        let merged =
-            AdaptiveRadixTree::merge_all_with(vec![t1, t2, t3], |acc, v| format!("({acc}+{v})"));
+        let merged = AdaptiveRadixTree::merge_all_with(vec![t1, t2, t3], |acc, v| acc + v);
 
-        // Should be "((a+b)+c)" showing left-to-right fold.
-        assert_eq!(merged.get("key"), Some(&"((a+b)+c)".to_string()));
+        // Sum is commutative, so order doesn't matter.
+        assert_eq!(merged.get("key"), Some(&6));
     }
 
     #[test]
