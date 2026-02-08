@@ -479,7 +479,7 @@ where
             }
             _ => {
                 // Collect non-empty roots with their tree indices.
-                let roots: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]> = trees
+                let roots: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]> = trees
                     .into_iter()
                     .enumerate()
                     .filter_map(|(idx, t)| {
@@ -587,21 +587,21 @@ where
     /// - extensions: nodes grouped by their divergence byte after the LCP
     /// - lcp: the longest common prefix itself
     fn partition_by_lcp(
-        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         lcp_len: usize,
     ) -> (
-        SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
-        BTreeMap<u8, SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>>,
+        SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
+        BTreeMap<u8, SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>>,
         KeyType::PartialType,
     ) {
         // Extract LCP from the first node.
         let lcp = nodes[0].node.prefix.partial_before(lcp_len);
 
-        let mut exact_matches: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]> =
+        let mut exact_matches: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]> =
             SmallVec::new();
         let mut extensions: BTreeMap<
             u8,
-            SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+            SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         > = BTreeMap::new();
 
         for tagged in nodes {
@@ -623,7 +623,7 @@ where
 
     /// Recursively merge N nodes into a single node with a conflict resolver.
     fn merge_n_nodes_with<F>(
-        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         f: &mut F,
     ) -> DefaultNode<KeyType::PartialType, ValueType>
     where
@@ -730,7 +730,7 @@ where
     /// iterators yield `(byte, child)` pairs in sorted byte order, so we can
     /// advance them in lockstep and collect children sharing the same byte.
     fn merge_n_children_with<F>(
-        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         f: &mut F,
     ) -> Vec<(u8, DefaultNode<KeyType::PartialType, ValueType>, usize)>
     where
@@ -755,8 +755,16 @@ where
                 break;
             };
 
-            // Collect all children at current_byte from any iterator that has it.
-            let mut children: SmallVec<[TaggedNode<_, _>; 4]> = SmallVec::new();
+            // Count children at current_byte first.
+            let mut count = 0;
+            for (iter, _) in &mut iters {
+                if iter.peek().map(|(b, _)| *b) == Some(current_byte) {
+                    count += 1;
+                }
+            }
+
+            // Collect children with pre-allocated capacity.
+            let mut children: SmallVec<[TaggedNode<_, _>; 16]> = SmallVec::with_capacity(count);
             for (iter, tree_idx) in &mut iters {
                 if iter.peek().map(|(b, _)| *b) == Some(current_byte) {
                     let (_, child) = iter.next().unwrap();
