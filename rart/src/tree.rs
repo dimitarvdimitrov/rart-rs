@@ -4,7 +4,10 @@
 //! functionality for the RART crate.
 
 use std::cmp::{Ordering, min};
+use std::collections::BTreeMap;
 use std::ops::RangeBounds;
+
+use smallvec::SmallVec;
 
 use crate::iter::{Iter, ValuesIter};
 use crate::keys::KeyTrait;
@@ -361,6 +364,69 @@ where
             (Some(root1), Some(root2)) => Self::from_root(Self::merge_nodes(root1, root2)),
         }
     }
+
+    /// Merge multiple trees into one, consuming all inputs.
+    ///
+    /// Later trees in the iterator win on key conflicts (right-wins semantics).
+    /// For N=2, this delegates to the optimized 2-way merge to avoid
+    /// the overhead of the N-way machinery.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use rart::{AdaptiveRadixTree, ArrayKey};
+    ///
+    /// let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+    /// t1.insert("apple", 1);
+    ///
+    /// let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+    /// t2.insert("apple", 2);  // Will overwrite t1's value
+    /// t2.insert("banana", 3);
+    ///
+    /// let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+    /// t3.insert("cherry", 4);
+    ///
+    /// let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+    ///
+    /// assert_eq!(merged.get("apple"), Some(&2));  // t2 wins
+    /// assert_eq!(merged.get("banana"), Some(&3));
+    /// assert_eq!(merged.get("cherry"), Some(&4));
+    /// ```
+    pub fn merge_all(trees: impl IntoIterator<Item = Self>) -> Self {
+        let trees: Vec<_> = trees.into_iter().collect();
+        match trees.len() {
+            0 => Self::new(),
+            1 => trees.into_iter().next().unwrap(),
+            2 => {
+                // Use optimized 2-way merge for N=2.
+                let mut iter = trees.into_iter();
+                let a = iter.next().unwrap();
+                let b = iter.next().unwrap();
+                a.merge(b)
+            }
+            _ => {
+                // Collect non-empty roots with their tree indices.
+                let roots: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]> = trees
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, t)| {
+                        t.root.map(|r| TaggedNode {
+                            node: r,
+                            tree_idx: idx,
+                        })
+                    })
+                    .collect();
+
+                if roots.is_empty() {
+                    Self::new()
+                } else if roots.len() == 1 {
+                    Self::from_root(roots.into_iter().next().unwrap().node)
+                } else {
+                    Self::from_root(Self::merge_n_nodes(roots))
+                }
+            }
+        }
+    }
 }
 
 impl<KeyType, ValueType> TreeStatsTrait for AdaptiveRadixTree<KeyType, ValueType>
@@ -400,11 +466,230 @@ where
     }
 }
 
+/// A node paired with its source tree index for right-wins semantics.
+/// Higher tree_idx wins in conflicts (last tree in the input list).
+struct TaggedNode<P: Partial, V> {
+    node: DefaultNode<P, V>,
+    tree_idx: usize,
+}
+
 // Internals implementation
 impl<KeyType, ValueType> AdaptiveRadixTree<KeyType, ValueType>
 where
     KeyType: KeyTrait,
 {
+    // ==================== N-Way Merge Implementation ====================
+
+    /// Recursively merge N nodes into a single node.
+    ///
+    /// This is the core of the N-way merge algorithm. It partitions nodes by their
+    /// longest common prefix (LCP) and recursively merges groups.
+    fn merge_n_nodes(
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+    ) -> DefaultNode<KeyType::PartialType, ValueType> {
+        debug_assert!(!nodes.is_empty(), "merge_n_nodes called with empty nodes");
+
+        // Base case: single node.
+        if nodes.len() == 1 {
+            return nodes.into_iter().next().unwrap().node;
+        }
+
+        // Find the longest common prefix among all nodes.
+        let lcp_len = Self::find_lcp_n(&nodes);
+
+        // Check if all nodes are leaves with identical prefixes (same key).
+        // In this case, right-wins: take the one with highest tree_idx.
+        let all_same_key_leaves = nodes
+            .iter()
+            .all(|tagged| tagged.node.is_leaf() && tagged.node.prefix.len() == lcp_len);
+        if all_same_key_leaves {
+            return nodes
+                .into_iter()
+                .max_by_key(|tagged| tagged.tree_idx)
+                .unwrap()
+                .node;
+        }
+
+        // Partition nodes by their relationship to the LCP.
+        let (exact_matches, extensions, lcp) = Self::partition_by_lcp(nodes, lcp_len);
+
+        // Build result node with prefix = LCP.
+        // Estimate capacity: extensions count + merged children from exact matches.
+        let capacity = extensions.len() + if exact_matches.is_empty() { 0 } else { 256 };
+        let mut result = DefaultNode::new_inner_with_capacity(lcp, capacity);
+
+        // Track max tree_idx for each extension byte, needed for conflict resolution.
+        let mut extension_tree_idx: BTreeMap<u8, usize> = BTreeMap::new();
+
+        // Handle extension groups: nodes that diverge beyond the LCP.
+        // Each extension group becomes a child at its divergence byte.
+        for (diverge_byte, mut group) in extensions {
+            // Track the max tree_idx for this extension group.
+            let max_idx = group.iter().map(|t| t.tree_idx).max().unwrap();
+            extension_tree_idx.insert(diverge_byte, max_idx);
+
+            // Truncate prefixes: remove the LCP (but keep the divergence byte).
+            // Use partial_after(lcp_len) to keep the divergence byte as first byte.
+            for tagged in &mut group {
+                debug_assert!(
+                    lcp_len < tagged.node.prefix.len(),
+                    "extension node prefix should be longer than LCP"
+                );
+                tagged.node.prefix = tagged.node.prefix.partial_after(lcp_len);
+            }
+
+            // Recursively merge this group.
+            let child = if group.len() == 1 {
+                group.into_iter().next().unwrap().node
+            } else {
+                Self::merge_n_nodes(group)
+            };
+            result.add_child(diverge_byte, child);
+        }
+
+        // Handle exact matches: nodes whose prefix equals the LCP exactly.
+        // These are inner nodes that need their children merged together.
+        if !exact_matches.is_empty() {
+            let merged_children = Self::merge_n_children(exact_matches);
+            for (byte, child, exact_tree_idx) in merged_children {
+                // Check if we already have a child at this byte from extensions.
+                // If so, merge them recursively, preserving the actual tree indices.
+                if let Some(existing) = result.delete_child(byte) {
+                    let ext_tree_idx = extension_tree_idx[&byte];
+                    let merged = Self::merge_n_nodes(smallvec::smallvec![
+                        TaggedNode {
+                            node: existing,
+                            tree_idx: ext_tree_idx,
+                        },
+                        TaggedNode {
+                            node: child,
+                            tree_idx: exact_tree_idx,
+                        },
+                    ]);
+                    result.add_child(byte, merged);
+                } else {
+                    result.add_child(byte, child);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Find the longest common prefix length among N nodes.
+    ///
+    /// Uses pairwise reduction: compare first node's prefix against all others,
+    /// taking the minimum common length. This is O(N * L) where L is max prefix length.
+    fn find_lcp_n(nodes: &[TaggedNode<KeyType::PartialType, ValueType>]) -> usize {
+        debug_assert!(!nodes.is_empty(), "find_lcp_n called with empty nodes");
+
+        if nodes.len() == 1 {
+            return nodes[0].node.prefix.len();
+        }
+
+        let first_prefix = &nodes[0].node.prefix;
+        let mut lcp_len = first_prefix.len();
+
+        for tagged in nodes.iter().skip(1) {
+            lcp_len = min(
+                lcp_len,
+                first_prefix.prefix_length_common(&tagged.node.prefix),
+            );
+            if lcp_len == 0 {
+                break; // Early exit: no common prefix.
+            }
+        }
+
+        lcp_len
+    }
+
+    /// Partition N nodes by their relationship to the LCP.
+    ///
+    /// Returns:
+    /// - exact_matches: nodes whose prefix equals the LCP exactly (these are inner nodes)
+    /// - extensions: nodes grouped by their divergence byte after the LCP
+    /// - lcp: the longest common prefix itself
+    fn partition_by_lcp(
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        lcp_len: usize,
+    ) -> (
+        SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        BTreeMap<u8, SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>>,
+        KeyType::PartialType,
+    ) {
+        // Extract LCP from the first node.
+        let lcp = nodes[0].node.prefix.partial_before(lcp_len);
+
+        let mut exact_matches: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]> =
+            SmallVec::new();
+        let mut extensions: BTreeMap<
+            u8,
+            SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+        > = BTreeMap::new();
+
+        for tagged in nodes {
+            let prefix_len = tagged.node.prefix.len();
+            if prefix_len == lcp_len {
+                // Exact match: prefix equals LCP.
+                exact_matches.push(tagged);
+            } else {
+                // Extension: prefix extends beyond LCP.
+                let diverge_byte = tagged.node.prefix.at(lcp_len);
+                extensions.entry(diverge_byte).or_default().push(tagged);
+            }
+        }
+
+        (exact_matches, extensions, lcp)
+    }
+
+    /// Merge children from N inner nodes that have the same prefix.
+    ///
+    /// Uses a 256-slot array accumulator to collect children by key byte,
+    /// then recursively merges children that appear in multiple nodes.
+    ///
+    /// Returns tuples of (byte, merged_child, max_tree_idx) where max_tree_idx
+    /// is the highest tree index among all children that contributed to this byte.
+    /// This is needed to preserve right-wins semantics when merging with extension nodes.
+    fn merge_n_children(
+        nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
+    ) -> Vec<(u8, DefaultNode<KeyType::PartialType, ValueType>, usize)> {
+        // Use a 256-slot array to collect children by key byte.
+        // Each slot holds a SmallVec of (tree_idx, child_node) pairs.
+        let mut slots: [Option<SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>>; 256] =
+            std::array::from_fn(|_| None);
+
+        for tagged in nodes {
+            let tree_idx = tagged.tree_idx;
+            for (byte, child) in tagged.node.into_children() {
+                let slot = &mut slots[byte as usize];
+                let group = slot.get_or_insert_with(SmallVec::new);
+                group.push(TaggedNode {
+                    node: child,
+                    tree_idx,
+                });
+            }
+        }
+
+        // Process non-empty slots.
+        let mut result = Vec::new();
+        for (byte, slot) in slots.into_iter().enumerate() {
+            if let Some(group) = slot {
+                // Track the max tree_idx among all children at this byte.
+                let max_tree_idx = group.iter().map(|t| t.tree_idx).max().unwrap();
+                let child = if group.len() == 1 {
+                    group.into_iter().next().unwrap().node
+                } else {
+                    Self::merge_n_nodes(group)
+                };
+                result.push((byte as u8, child, max_tree_idx));
+            }
+        }
+
+        result
+    }
+
+    // ==================== 2-Way Merge Implementation ====================
+
     /// Recursively merge two nodes.
     ///
     /// This function handles four cases based on how the prefixes of the two nodes relate:
@@ -1909,6 +2194,420 @@ mod tests {
         assert_eq!(merged.get("abc"), Some(&1));
         assert_eq!(merged.get("abcd"), Some(&3));
         assert_eq!(merged.get("abcdef"), Some(&2));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    // ==================== N-Way Merge Tests ====================
+
+    #[test]
+    fn test_merge_all_empty() {
+        let trees: Vec<AdaptiveRadixTree<ArrayKey<16>, i32>> = vec![];
+        let merged = AdaptiveRadixTree::merge_all(trees);
+        assert!(merged.is_empty());
+        assert_eq!(merged.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_merge_all_single() {
+        let mut tree = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        tree.insert("key", 1);
+        tree.insert("other", 2);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![tree]);
+
+        assert_eq!(merged.get("key"), Some(&1));
+        assert_eq!(merged.get("other"), Some(&2));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_all_two_equals_pairwise() {
+        // Property: merge_all([a, b]) == a.merge(b) for identical inputs.
+        let mut a1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut b1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut a2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut b2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        // Populate identical trees.
+        for (i, key) in ["apple", "banana", "cherry", "date"].iter().enumerate() {
+            a1.insert(*key, i as i32);
+            a2.insert(*key, i as i32);
+        }
+        for (i, key) in ["apple", "elderberry", "fig"].iter().enumerate() {
+            b1.insert(*key, i as i32 + 100);
+            b2.insert(*key, i as i32 + 100);
+        }
+
+        let n_way = AdaptiveRadixTree::merge_all(vec![a1, b1]);
+        let pairwise = a2.merge(b2);
+
+        // Compare iteration results.
+        let n_way_items: Vec<_> = n_way.iter().map(|(k, v)| (k, *v)).collect();
+        let pairwise_items: Vec<_> = pairwise.iter().map(|(k, v)| (k, *v)).collect();
+
+        assert_eq!(n_way_items, pairwise_items);
+    }
+
+    #[test]
+    fn test_merge_all_three_right_wins() {
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t1.insert("key", 1);
+        t2.insert("key", 2);
+        t3.insert("key", 3);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        // Last tree wins.
+        assert_eq!(merged.get("key"), Some(&3));
+        assert_eq!(merged.iter().count(), 1);
+    }
+
+    #[test]
+    fn test_merge_all_disjoint_prefixes() {
+        // Trees with completely different prefixes should just combine.
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t1.insert("aaa", 1);
+        t2.insert("bbb", 2);
+        t3.insert("ccc", 3);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        assert_eq!(merged.get("aaa"), Some(&1));
+        assert_eq!(merged.get("bbb"), Some(&2));
+        assert_eq!(merged.get("ccc"), Some(&3));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_all_shared_prefix_different_children() {
+        // All trees share "app" prefix but have different completions.
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t1.insert("apple", 1);
+        t2.insert("application", 2);
+        t3.insert("apricot", 3);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        assert_eq!(merged.get("apple"), Some(&1));
+        assert_eq!(merged.get("application"), Some(&2));
+        assert_eq!(merged.get("apricot"), Some(&3));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_all_deep_overlap_with_conflicts() {
+        // Deep prefix overlap with conflicts at various levels.
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<32>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<32>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<32>, i32>::new();
+
+        t1.insert("aaaaaaaaaaaa1", 1);
+        t1.insert("aaaaaaaaaaaa2", 2);
+        t2.insert("aaaaaaaaaaaa1", 10); // Conflict with t1.
+        t2.insert("aaaaaaaaaaaa3", 3);
+        t3.insert("aaaaaaaaaaaa2", 20); // Conflict with t1.
+        t3.insert("aaaaaaaaaaaa4", 4);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        // t2 wins for "...1", t3 wins for "...2".
+        assert_eq!(merged.get("aaaaaaaaaaaa1"), Some(&10));
+        assert_eq!(merged.get("aaaaaaaaaaaa2"), Some(&20));
+        assert_eq!(merged.get("aaaaaaaaaaaa3"), Some(&3));
+        assert_eq!(merged.get("aaaaaaaaaaaa4"), Some(&4));
+        assert_eq!(merged.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_merge_all_with_empty_trees() {
+        // Mix of empty and non-empty trees.
+        let t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t4 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t2.insert("key2", 2);
+        t4.insert("key4", 4);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3, t4]);
+
+        assert_eq!(merged.get("key2"), Some(&2));
+        assert_eq!(merged.get("key4"), Some(&4));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_all_four_trees_right_wins_chain() {
+        // Test that rightmost value wins through the entire chain.
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t4 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        // All trees have same key with different values.
+        t1.insert("shared", 1);
+        t2.insert("shared", 2);
+        t3.insert("shared", 3);
+        t4.insert("shared", 4);
+
+        // Each tree also has unique keys.
+        t1.insert("unique1", 100);
+        t2.insert("unique2", 200);
+        t3.insert("unique3", 300);
+        t4.insert("unique4", 400);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3, t4]);
+
+        // t4 wins for "shared".
+        assert_eq!(merged.get("shared"), Some(&4));
+        // All unique keys are present.
+        assert_eq!(merged.get("unique1"), Some(&100));
+        assert_eq!(merged.get("unique2"), Some(&200));
+        assert_eq!(merged.get("unique3"), Some(&300));
+        assert_eq!(merged.get("unique4"), Some(&400));
+        assert_eq!(merged.iter().count(), 5);
+    }
+
+    #[test]
+    fn test_merge_all_iteration_order_is_lexicographic() {
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t1.insert("zebra", 1);
+        t2.insert("apple", 2);
+        t3.insert("mango", 3);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        let keys: Vec<_> = merged.iter().map(|(k, _)| k).collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+    }
+
+    #[test]
+    fn test_merge_all_seeded_random() {
+        // Property test: merge_all result matches fold approach.
+        let mut rng = StdRng::seed_from_u64(0xCAFEBABE);
+        const COUNT: usize = 200;
+        const SPACE: u64 = 1000;
+        const NUM_TREES: usize = 5;
+
+        let mut trees = Vec::new();
+        let mut maps = Vec::new();
+
+        for _ in 0..NUM_TREES {
+            let mut tree = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            let mut map = BTreeMap::new();
+            for _ in 0..COUNT {
+                let k = rng.random_range(0..SPACE);
+                let v = rng.random_range(0..u64::MAX);
+                tree.insert(k, v);
+                map.insert(k, v);
+            }
+            trees.push(tree);
+            maps.push(map);
+        }
+
+        // Compute expected: later maps win on conflicts.
+        let mut expected = BTreeMap::new();
+        for map in &maps {
+            for (k, v) in map {
+                expected.insert(*k, *v);
+            }
+        }
+
+        let merged = AdaptiveRadixTree::merge_all(trees);
+
+        // Verify all expected keys are present with correct values.
+        for (k, v) in &expected {
+            assert_eq!(merged.get(*k), Some(v), "Key {} mismatch", k);
+        }
+
+        // Verify count matches.
+        assert_eq!(merged.iter().count(), expected.len());
+
+        // Verify iteration order.
+        let merged_iter: Vec<_> = merged.iter().map(|(k, v)| (k.to_be_u64(), *v)).collect();
+        let expected_iter: Vec<_> = expected.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(merged_iter, expected_iter);
+    }
+
+    #[test]
+    fn test_merge_all_versus_fold() {
+        // Property: merge_all should produce same result as fold for any number of trees.
+        let mut rng = StdRng::seed_from_u64(0xDEADC0DE);
+        const COUNT: usize = 100;
+        const SPACE: u64 = 500;
+        const NUM_TREES: usize = 4;
+
+        // Build two identical sets of trees.
+        let mut trees_for_merge_all = Vec::new();
+        let mut trees_for_fold = Vec::new();
+
+        for _ in 0..NUM_TREES {
+            let mut tree1 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            let mut tree2 = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            for _ in 0..COUNT {
+                let k = rng.random_range(0..SPACE);
+                let v = rng.random_range(0..u64::MAX);
+                tree1.insert(k, v);
+                tree2.insert(k, v);
+            }
+            trees_for_merge_all.push(tree1);
+            trees_for_fold.push(tree2);
+        }
+
+        // Merge using merge_all.
+        let merged_n_way = AdaptiveRadixTree::merge_all(trees_for_merge_all);
+
+        // Merge using fold.
+        let merged_fold = trees_for_fold
+            .into_iter()
+            .reduce(|a, b| a.merge(b))
+            .unwrap();
+
+        // Compare results.
+        let n_way_items: Vec<_> = merged_n_way
+            .iter()
+            .map(|(k, v)| (k.to_be_u64(), *v))
+            .collect();
+        let fold_items: Vec<_> = merged_fold
+            .iter()
+            .map(|(k, v)| (k.to_be_u64(), *v))
+            .collect();
+
+        assert_eq!(n_way_items, fold_items);
+    }
+
+    #[test]
+    fn test_merge_all_numeric_keys() {
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t1.insert(100u64, 1);
+        t1.insert(200u64, 2);
+        t2.insert(100u64, 10); // Overwrite.
+        t2.insert(300u64, 3);
+        t3.insert(200u64, 20); // Overwrite.
+        t3.insert(400u64, 4);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        assert_eq!(merged.get(100u64), Some(&10)); // t2 wins.
+        assert_eq!(merged.get(200u64), Some(&20)); // t3 wins.
+        assert_eq!(merged.get(300u64), Some(&3));
+        assert_eq!(merged.get(400u64), Some(&4));
+        assert_eq!(merged.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_merge_all_vector_key() {
+        // Test with VectorKey to verify algorithm works with variable-length keys.
+        let mut t1 = AdaptiveRadixTree::<VectorKey, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<VectorKey, i32>::new();
+        let mut t3 = AdaptiveRadixTree::<VectorKey, i32>::new();
+
+        t1.insert_k(&VectorKey::new_from_slice(b"alpha"), 1);
+        t2.insert_k(&VectorKey::new_from_slice(b"alpha"), 10); // Overwrite.
+        t2.insert_k(&VectorKey::new_from_slice(b"beta"), 2);
+        t3.insert_k(&VectorKey::new_from_slice(b"gamma"), 3);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t1, t2, t3]);
+
+        assert_eq!(
+            merged.get_k(&VectorKey::new_from_slice(b"alpha")),
+            Some(&10)
+        );
+        assert_eq!(merged.get_k(&VectorKey::new_from_slice(b"beta")), Some(&2));
+        assert_eq!(merged.get_k(&VectorKey::new_from_slice(b"gamma")), Some(&3));
+        assert_eq!(merged.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_merge_all_extension_vs_exact_match_conflict() {
+        // Regression test: when an extension child conflicts with an exact-match
+        // child at the same byte, we must preserve the correct tree indices for
+        // right-wins semantics.
+        //
+        // Tree 0: inner at prefix "a" with child 'b' -> leaf "c" (key "abc")
+        // Tree 1: leaf at prefix "ab" (key "ab")
+        //
+        // After merge: both keys should exist, with Tree 1's "ab" taking precedence
+        // if there were a conflict (but here they are distinct keys).
+        let mut t0 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t0.insert("abc", 0);
+        t1.insert("ab", 1);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t0, t1]);
+
+        // Both keys should exist after merge.
+        assert_eq!(merged.get("abc"), Some(&0));
+        assert_eq!(merged.get("ab"), Some(&1));
+        assert_eq!(merged.iter().count(), 2);
+
+        // Also test with the trees in opposite order to verify right-wins.
+        let mut t0 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t0.insert("ab", 0);
+        t1.insert("abc", 1);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t0, t1]);
+
+        assert_eq!(merged.get("ab"), Some(&0));
+        assert_eq!(merged.get("abc"), Some(&1));
+        assert_eq!(merged.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_merge_all_extension_vs_exact_match_same_key() {
+        // Test right-wins when extension and exact-match have children leading
+        // to the same key.
+        //
+        // Tree 0: inner at "a" with child 'b' -> inner with child 'c' -> leaf (key "abc")
+        // Tree 1: leaf at "abc"
+        //
+        // The merged result should have "abc" with Tree 1's value (right-wins).
+        let mut t0 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t0.insert("abc", 0);
+        t1.insert("abc", 1);
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t0, t1]);
+
+        assert_eq!(merged.get("abc"), Some(&1)); // Tree 1 wins.
+        assert_eq!(merged.iter().count(), 1);
+
+        // Three-way test with conflict at extension/exact boundary.
+        let mut t0 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t1 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+        let mut t2 = AdaptiveRadixTree::<ArrayKey<16>, i32>::new();
+
+        t0.insert("abc", 0);
+        t0.insert("abd", 10);
+        t1.insert("ab", 1); // Exact match at "ab", extension from t0 at "ab" + 'c'/'d'.
+        t2.insert("abc", 2); // Should win over t0's "abc".
+
+        let merged = AdaptiveRadixTree::merge_all(vec![t0, t1, t2]);
+
+        assert_eq!(merged.get("ab"), Some(&1));
+        assert_eq!(merged.get("abc"), Some(&2)); // Tree 2 wins over Tree 0.
+        assert_eq!(merged.get("abd"), Some(&10));
         assert_eq!(merged.iter().count(), 3);
     }
 }

@@ -19,6 +19,7 @@ rust-version = "1.85"
 # Core dependencies
 num-traits = "0.2"
 simdeez = "2.0.0"
+smallvec = "1.13"
 
 # Dev dependencies
 blart = "0.4"

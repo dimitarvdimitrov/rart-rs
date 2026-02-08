@@ -25,6 +25,7 @@ simd_keys = ["dep:simdeez"]
 [dependencies]
 num-traits.workspace = true
 simdeez = { workspace = true, optional = true }
+smallvec.workspace = true
 
 [[bench]]
 name = "art_bench"

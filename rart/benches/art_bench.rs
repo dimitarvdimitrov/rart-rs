@@ -391,4 +391,135 @@ criterion_group!(
     config = criterion_config();
     targets = bench_merge_disjoint_10k, bench_merge_50pct_overlap_10k, bench_merge_sequential_ranges, bench_merge_naive_disjoint_10k, bench_merge_naive_50pct_overlap_10k
 );
-criterion_main!(seq_benches, rand_benches, merge_benches);
+
+// N-way merge benchmarks: 16 trees of 1000 values each
+
+/// Build 16 trees with disjoint keys (tree i gets keys i, i+16, i+32, ...).
+fn build_16_trees_disjoint() -> Vec<AdaptiveRadixTree<ArrayKey<16>, u64>> {
+    (0..16)
+        .map(|tree_idx| {
+            let mut tree = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            for i in 0..1000u64 {
+                let key = tree_idx as u64 + i * 16;
+                tree.insert(key, key);
+            }
+            tree
+        })
+        .collect()
+}
+
+/// Build 16 trees with 50% overlap between consecutive trees.
+/// Tree i gets keys [i*500 .. i*500 + 1000).
+fn build_16_trees_50pct_overlap() -> Vec<AdaptiveRadixTree<ArrayKey<16>, u64>> {
+    (0..16)
+        .map(|tree_idx| {
+            let mut tree = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            let base = tree_idx as u64 * 500;
+            for i in 0..1000u64 {
+                let key = base + i;
+                tree.insert(key, key);
+            }
+            tree
+        })
+        .collect()
+}
+
+/// Build 16 trees with 100% overlap (all trees have the same keys 0..1000).
+fn build_16_trees_full_overlap() -> Vec<AdaptiveRadixTree<ArrayKey<16>, u64>> {
+    (0..16)
+        .map(|tree_idx| {
+            let mut tree = AdaptiveRadixTree::<ArrayKey<16>, u64>::new();
+            for i in 0..1000u64 {
+                // Value encodes tree_idx so we can verify right-wins
+                tree.insert(i, i + tree_idx as u64 * 10000);
+            }
+            tree
+        })
+        .collect()
+}
+
+/// Fold-based merge: trees.into_iter().reduce(|a, b| a.merge(b))
+fn fold_merge(
+    trees: Vec<AdaptiveRadixTree<ArrayKey<16>, u64>>,
+) -> AdaptiveRadixTree<ArrayKey<16>, u64> {
+    trees
+        .into_iter()
+        .reduce(|a, b| a.merge(b))
+        .unwrap_or_else(AdaptiveRadixTree::new)
+}
+
+/// N-way merge: 16 disjoint trees via fold
+pub fn bench_merge_16_fold_disjoint(c: &mut Criterion) {
+    c.bench_function("merge_16_fold_disjoint", |b| {
+        b.iter_batched(
+            build_16_trees_disjoint,
+            |trees| std::hint::black_box(fold_merge(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// N-way merge: 16 disjoint trees via merge_all
+pub fn bench_merge_16_nway_disjoint(c: &mut Criterion) {
+    c.bench_function("merge_16_nway_disjoint", |b| {
+        b.iter_batched(
+            build_16_trees_disjoint,
+            |trees| std::hint::black_box(AdaptiveRadixTree::merge_all(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// N-way merge: 16 trees with 50% overlap via fold
+pub fn bench_merge_16_fold_50pct_overlap(c: &mut Criterion) {
+    c.bench_function("merge_16_fold_50pct_overlap", |b| {
+        b.iter_batched(
+            build_16_trees_50pct_overlap,
+            |trees| std::hint::black_box(fold_merge(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// N-way merge: 16 trees with 50% overlap via merge_all
+pub fn bench_merge_16_nway_50pct_overlap(c: &mut Criterion) {
+    c.bench_function("merge_16_nway_50pct_overlap", |b| {
+        b.iter_batched(
+            build_16_trees_50pct_overlap,
+            |trees| std::hint::black_box(AdaptiveRadixTree::merge_all(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// N-way merge: 16 trees with 100% overlap via fold
+pub fn bench_merge_16_fold_full_overlap(c: &mut Criterion) {
+    c.bench_function("merge_16_fold_full_overlap", |b| {
+        b.iter_batched(
+            build_16_trees_full_overlap,
+            |trees| std::hint::black_box(fold_merge(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+/// N-way merge: 16 trees with 100% overlap via merge_all
+pub fn bench_merge_16_nway_full_overlap(c: &mut Criterion) {
+    c.bench_function("merge_16_nway_full_overlap", |b| {
+        b.iter_batched(
+            build_16_trees_full_overlap,
+            |trees| std::hint::black_box(AdaptiveRadixTree::merge_all(trees)),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+criterion_group!(
+    name = merge_n_benches;
+    config = criterion_config();
+    targets = bench_merge_16_fold_disjoint, bench_merge_16_nway_disjoint,
+              bench_merge_16_fold_50pct_overlap, bench_merge_16_nway_50pct_overlap,
+              bench_merge_16_fold_full_overlap, bench_merge_16_nway_full_overlap
+);
+
+criterion_main!(seq_benches, rand_benches, merge_benches, merge_n_benches);
