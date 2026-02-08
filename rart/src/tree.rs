@@ -663,17 +663,16 @@ where
         // Partition nodes by their relationship to the LCP.
         let (exact_matches, extensions, lcp) = Self::partition_by_lcp(nodes, lcp_len);
 
-        // Build result node with prefix = LCP.
-        let capacity = extensions.len() + exact_matches.len()/4;
-        let mut result = DefaultNode::new_inner_with_capacity(lcp, capacity);
+        // Collect all children by byte before adding to result.
+        // This avoids delete_child which can shrink the node to a leaf mid-construction.
+        let mut children_by_byte: BTreeMap<
+            u8,
+            (DefaultNode<KeyType::PartialType, ValueType>, usize),
+        > = BTreeMap::new();
 
-        // Track max tree_idx for each extension byte.
-        let mut extension_tree_idx: BTreeMap<u8, usize> = BTreeMap::new();
-
-        // Handle extension groups.
+        // Handle extension groups - collect into map.
         for (diverge_byte, mut group) in extensions {
             let max_idx = group.iter().map(|t| t.tree_idx).max().unwrap();
-            extension_tree_idx.insert(diverge_byte, max_idx);
 
             for tagged in &mut group {
                 debug_assert!(
@@ -688,15 +687,14 @@ where
             } else {
                 Self::merge_n_nodes_with(group, f)
             };
-            result.add_child(diverge_byte, child);
+            children_by_byte.insert(diverge_byte, (child, max_idx));
         }
 
-        // Handle exact matches.
+        // Handle exact matches - merge with extensions where they overlap.
         if !exact_matches.is_empty() {
             let merged_children = Self::merge_n_children_with(exact_matches, f);
             for (byte, child, exact_tree_idx) in merged_children {
-                if let Some(existing) = result.delete_child(byte) {
-                    let ext_tree_idx = extension_tree_idx[&byte];
+                if let Some((existing, ext_tree_idx)) = children_by_byte.remove(&byte) {
                     let merged = Self::merge_n_nodes_with(
                         smallvec::smallvec![
                             TaggedNode {
@@ -710,11 +708,17 @@ where
                         ],
                         f,
                     );
-                    result.add_child(byte, merged);
+                    children_by_byte.insert(byte, (merged, ext_tree_idx.max(exact_tree_idx)));
                 } else {
-                    result.add_child(byte, child);
+                    children_by_byte.insert(byte, (child, exact_tree_idx));
                 }
             }
+        }
+
+        // Build result node and add all children at once.
+        let mut result = DefaultNode::new_inner_with_capacity(lcp, children_by_byte.len());
+        for (byte, (child, _tree_idx)) in children_by_byte {
+            result.add_child(byte, child);
         }
 
         result
