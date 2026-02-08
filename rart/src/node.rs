@@ -256,6 +256,28 @@ impl<P: Partial, V> Node<P, V> for DefaultNode<P, V> {
 }
 
 impl<P: Partial, V> DefaultNode<P, V> {
+    /// Create a new inner node with a capacity hint.
+    ///
+    /// Pre-sizes the node to avoid repeated grow operations during bulk insertion.
+    /// The actual node type is chosen based on the minimum capacity needed:
+    /// - capacity <= 4: Node4
+    /// - capacity <= 16: Node16
+    /// - capacity <= 48: Node48
+    /// - capacity > 48: Node256
+    #[inline]
+    pub fn new_inner_with_capacity(prefix: P, min_capacity: usize) -> Self {
+        let content = if min_capacity <= 4 {
+            Content::Node4(SortedKeyedMapping::new())
+        } else if min_capacity <= 16 {
+            Content::Node16(SortedKeyedMapping::new())
+        } else if min_capacity <= 48 {
+            Content::Node48(IndexedMapping::new())
+        } else {
+            Content::Node256(DirectMapping::new())
+        };
+        Self { prefix, content }
+    }
+
     #[inline]
     #[allow(dead_code)]
     pub fn new_4(prefix: P) -> Self {

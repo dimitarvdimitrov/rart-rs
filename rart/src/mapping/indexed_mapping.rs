@@ -24,10 +24,17 @@ impl<N, const WIDTH: usize, Bitset: BitsetTrait> IntoIterator for IndexedMapping
     type Item = (u8, N);
     type IntoIter = IndexedMappingIntoIter<N, WIDTH, Bitset>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        // Take ownership of the key iterator and set num_children to 0 to prevent
+        // Drop from running on the children (we're moving them out).
+        let key_iter = self.child_ptr_indexes.bitset.iter();
+        let num_children = self.num_children;
+        self.num_children = 0;
+
         IndexedMappingIntoIter {
-            key_iter: self.child_ptr_indexes.bitset.iter(),
+            key_iter,
             mapping: self,
+            remaining: num_children,
         }
     }
 }
@@ -35,6 +42,7 @@ impl<N, const WIDTH: usize, Bitset: BitsetTrait> IntoIterator for IndexedMapping
 pub struct IndexedMappingIntoIter<N, const WIDTH: usize, Bitset: BitsetTrait> {
     key_iter: BitsetOnesIter<u64, 4>,
     mapping: IndexedMapping<N, WIDTH, Bitset>,
+    remaining: u8,
 }
 
 impl<N, const WIDTH: usize, Bitset: BitsetTrait> Iterator
@@ -44,12 +52,16 @@ impl<N, const WIDTH: usize, Bitset: BitsetTrait> Iterator
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.key_iter.next()? as u8;
-        let child = self.mapping.delete_child(key)?;
+        // Look up the position directly and take the child without full delete_child
+        // bookkeeping. We've already set num_children to 0 to prevent double-drop.
+        let pos = self.mapping.child_ptr_indexes.erase(key as usize)?;
+        let child = self.mapping.children.erase(pos as usize)?;
+        self.remaining -= 1;
         Some((key, child))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.mapping.num_children as usize;
+        let remaining = self.remaining as usize;
         (remaining, Some(remaining))
     }
 }

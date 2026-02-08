@@ -3,7 +3,7 @@
 //! This module contains the main [`AdaptiveRadixTree`] implementation and related
 //! functionality for the RART crate.
 
-use std::cmp::min;
+use std::cmp::{Ordering, min};
 use std::ops::RangeBounds;
 
 use crate::iter::{Iter, ValuesIter};
@@ -412,6 +412,7 @@ where
     /// 2. node1's prefix is a prefix of node2's: node1 becomes parent, node2 becomes child.
     /// 3. node2's prefix is a prefix of node1's: node2 becomes parent, node1 becomes child.
     /// 4. Prefixes diverge: create new parent with common prefix, both nodes as children.
+    #[inline]
     fn merge_nodes(
         node1: DefaultNode<KeyType::PartialType, ValueType>,
         node2: DefaultNode<KeyType::PartialType, ValueType>,
@@ -442,6 +443,7 @@ where
     }
 
     /// Merge two nodes with identical prefixes.
+    #[inline]
     fn merge_same_prefix(
         node1: DefaultNode<KeyType::PartialType, ValueType>,
         node2: DefaultNode<KeyType::PartialType, ValueType>,
@@ -460,35 +462,43 @@ where
                 )
             }
 
-            // Both inner nodes: merge children recursively.
+            // Both inner nodes: merge children recursively using merge-join.
             (false, false) => {
                 let prefix = node1.prefix.clone();
-                let mut result = DefaultNode::new_inner(prefix);
+                let capacity = node1.num_children() + node2.num_children();
+                let mut result = DefaultNode::new_inner_with_capacity(prefix, capacity);
 
-                // Use a 256-element array to pair up children from both nodes.
-                // Each slot holds (Option<child_from_node1>, Option<child_from_node2>).
-                type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
-                const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
-                    (None, None)
-                }
-                let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
-                    [const { init_pair() }; 256];
+                // Merge-join on sorted iterators. Both iterators yield children in key order.
+                let mut iter1 = node1.into_children().peekable();
+                let mut iter2 = node2.into_children().peekable();
 
-                for (k, child) in node1.into_children() {
-                    children[k as usize].0 = Some(child);
-                }
-                for (k, child) in node2.into_children() {
-                    children[k as usize].1 = Some(child);
-                }
-
-                // Merge children at each key.
-                for (k, (c1, c2)) in children.into_iter().enumerate() {
-                    let merged = match (c1, c2) {
-                        (None, None) => continue,
-                        (Some(child), None) | (None, Some(child)) => child,
-                        (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
-                    };
-                    result.add_child(k as u8, merged);
+                loop {
+                    match (iter1.peek(), iter2.peek()) {
+                        (None, None) => break,
+                        (Some(_), None) => {
+                            let (k, child) = iter1.next().unwrap();
+                            result.add_child(k, child);
+                        }
+                        (None, Some(_)) => {
+                            let (k, child) = iter2.next().unwrap();
+                            result.add_child(k, child);
+                        }
+                        (Some((k1, _)), Some((k2, _))) => match k1.cmp(k2) {
+                            Ordering::Less => {
+                                let (k, child) = iter1.next().unwrap();
+                                result.add_child(k, child);
+                            }
+                            Ordering::Greater => {
+                                let (k, child) = iter2.next().unwrap();
+                                result.add_child(k, child);
+                            }
+                            Ordering::Equal => {
+                                let (k, child1) = iter1.next().unwrap();
+                                let (_, child2) = iter2.next().unwrap();
+                                result.add_child(k, Self::merge_nodes(child1, child2));
+                            }
+                        },
+                    }
                 }
 
                 result
@@ -498,6 +508,7 @@ where
 
     /// Merge when node1's prefix is a prefix of node2's prefix.
     /// node1 becomes the parent, node2 is inserted as a child.
+    #[inline]
     fn merge_node1_is_prefix(
         node1: DefaultNode<KeyType::PartialType, ValueType>,
         mut node2: DefaultNode<KeyType::PartialType, ValueType>,
@@ -514,32 +525,46 @@ where
         }
 
         // node1 is inner. Truncate node2's prefix and insert it as a child.
-        let child_key = node2.prefix.at(common_len);
+        let extra_key = node2.prefix.at(common_len);
         node2.prefix = node2.prefix.partial_after(common_len);
 
-        // Build the result node with node1's prefix.
-        let mut result = DefaultNode::new_inner(node1.prefix.clone());
+        let prefix = node1.prefix.clone();
+        let capacity = node1.num_children() + 1;
+        let mut result = DefaultNode::new_inner_with_capacity(prefix, capacity);
 
-        // Collect existing children, potentially merging with node2.
-        type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
-        const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
-            (None, None)
-        }
-        let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
-            [const { init_pair() }; 256];
+        // Merge-join: node1's children iterator and a single-element "iterator" for node2.
+        // On collision, node2 wins (right-wins semantics).
+        let mut iter1 = node1.into_children().peekable();
+        let mut extra = Some((extra_key, node2));
 
-        for (k, child) in node1.into_children() {
-            children[k as usize].0 = Some(child);
-        }
-        children[child_key as usize].1 = Some(node2);
-
-        for (k, (c1, c2)) in children.into_iter().enumerate() {
-            let merged = match (c1, c2) {
-                (None, None) => continue,
-                (Some(child), None) | (None, Some(child)) => child,
-                (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
-            };
-            result.add_child(k as u8, merged);
+        loop {
+            match (iter1.peek(), extra.as_ref()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let (k, child) = iter1.next().unwrap();
+                    result.add_child(k, child);
+                }
+                (None, Some(_)) => {
+                    let (k, child) = extra.take().unwrap();
+                    result.add_child(k, child);
+                }
+                (Some((k1, _)), Some((ek, _))) => match k1.cmp(ek) {
+                    Ordering::Less => {
+                        let (k, child) = iter1.next().unwrap();
+                        result.add_child(k, child);
+                    }
+                    Ordering::Greater => {
+                        let (k, child) = extra.take().unwrap();
+                        result.add_child(k, child);
+                    }
+                    Ordering::Equal => {
+                        // Keys match: merge with node2's child winning (right-wins).
+                        let (k, child1) = iter1.next().unwrap();
+                        let (_, child2) = extra.take().unwrap();
+                        result.add_child(k, Self::merge_nodes(child1, child2));
+                    }
+                },
+            }
         }
 
         result
@@ -547,6 +572,7 @@ where
 
     /// Merge when node2's prefix is a prefix of node1's prefix.
     /// node2 becomes the parent, node1 is inserted as a child.
+    #[inline]
     fn merge_node2_is_prefix(
         mut node1: DefaultNode<KeyType::PartialType, ValueType>,
         node2: DefaultNode<KeyType::PartialType, ValueType>,
@@ -561,32 +587,47 @@ where
         }
 
         // node2 is inner. Truncate node1's prefix and insert it as a child.
-        let child_key = node1.prefix.at(common_len);
+        let extra_key = node1.prefix.at(common_len);
         node1.prefix = node1.prefix.partial_after(common_len);
 
-        // Check if node2 already has a child at this key.
-        let mut result = DefaultNode::new_inner(node2.prefix.clone());
+        let prefix = node2.prefix.clone();
+        let capacity = node2.num_children() + 1;
+        let mut result = DefaultNode::new_inner_with_capacity(prefix, capacity);
 
-        // Collect existing children, potentially merging with node1.
-        type ChildPair<P, V> = (Option<DefaultNode<P, V>>, Option<DefaultNode<P, V>>);
-        const fn init_pair<P: crate::partials::Partial, V>() -> ChildPair<P, V> {
-            (None, None)
-        }
-        let mut children: [ChildPair<KeyType::PartialType, ValueType>; 256] =
-            [const { init_pair() }; 256];
+        // Merge-join: node2's children iterator and a single-element "iterator" for node1.
+        // On collision, node2's child wins (right-wins semantics).
+        let mut iter2 = node2.into_children().peekable();
+        let mut extra = Some((extra_key, node1));
 
-        children[child_key as usize].0 = Some(node1);
-        for (k, child) in node2.into_children() {
-            children[k as usize].1 = Some(child);
-        }
-
-        for (k, (c1, c2)) in children.into_iter().enumerate() {
-            let merged = match (c1, c2) {
-                (None, None) => continue,
-                (Some(child), None) | (None, Some(child)) => child,
-                (Some(child1), Some(child2)) => Self::merge_nodes(child1, child2),
-            };
-            result.add_child(k as u8, merged);
+        loop {
+            match (iter2.peek(), extra.as_ref()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let (k, child) = iter2.next().unwrap();
+                    result.add_child(k, child);
+                }
+                (None, Some(_)) => {
+                    let (k, child) = extra.take().unwrap();
+                    result.add_child(k, child);
+                }
+                (Some((k2, _)), Some((ek, _))) => match k2.cmp(ek) {
+                    Ordering::Less => {
+                        let (k, child) = iter2.next().unwrap();
+                        result.add_child(k, child);
+                    }
+                    Ordering::Greater => {
+                        let (k, child) = extra.take().unwrap();
+                        result.add_child(k, child);
+                    }
+                    Ordering::Equal => {
+                        // Keys match: merge with node2's child winning (right-wins).
+                        // extra is from node1, iter2 is from node2.
+                        let (k, child2) = iter2.next().unwrap();
+                        let (_, child1) = extra.take().unwrap();
+                        result.add_child(k, Self::merge_nodes(child1, child2));
+                    }
+                },
+            }
         }
 
         result
@@ -594,6 +635,7 @@ where
 
     /// Merge two nodes whose prefixes diverge.
     /// Create a new parent node with the common prefix, and add both nodes as children.
+    #[inline]
     fn merge_divergent(
         mut node1: DefaultNode<KeyType::PartialType, ValueType>,
         mut node2: DefaultNode<KeyType::PartialType, ValueType>,

@@ -18,10 +18,17 @@ impl<N> IntoIterator for DirectMapping<N> {
     type Item = (u8, N);
     type IntoIter = DirectMappingIntoIter<N>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        // Take ownership of the key iterator and set num_children to 0 to prevent
+        // Drop from running on the children (we're moving them out).
+        let key_iter = self.children.bitset.iter();
+        let num_children = self.num_children;
+        self.num_children = 0;
+
         DirectMappingIntoIter {
-            key_iter: self.children.bitset.iter(),
+            key_iter,
             mapping: self,
+            remaining: num_children,
         }
     }
 }
@@ -29,6 +36,7 @@ impl<N> IntoIterator for DirectMapping<N> {
 pub struct DirectMappingIntoIter<N> {
     key_iter: BitsetOnesIter<u64, 4>,
     mapping: DirectMapping<N>,
+    remaining: usize,
 }
 
 impl<N> Iterator for DirectMappingIntoIter<N> {
@@ -36,13 +44,16 @@ impl<N> Iterator for DirectMappingIntoIter<N> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.key_iter.next()? as u8;
-        let child = self.mapping.delete_child(key)?;
+        // Take the child directly without updating counts or bitset. The bitset
+        // iteration already tells us which slots are occupied, and we've set
+        // num_children to 0 to prevent double-drop.
+        let child = self.mapping.children.erase(key as usize)?;
+        self.remaining -= 1;
         Some((key, child))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.mapping.num_children;
-        (remaining, Some(remaining))
+        (self.remaining, Some(self.remaining))
     }
 }
 
