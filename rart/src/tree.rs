@@ -721,6 +721,10 @@ where
     }
 
     /// Merge children from N inner nodes with a conflict resolver.
+    ///
+    /// Uses streaming N-way merge-join over peekable iterators. All child
+    /// iterators yield `(byte, child)` pairs in sorted byte order, so we can
+    /// advance them in lockstep and collect children sharing the same byte.
     fn merge_n_children_with<F>(
         nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>,
         f: &mut F,
@@ -728,32 +732,45 @@ where
     where
         F: FnMut(ValueType, ValueType) -> ValueType,
     {
-        let mut slots: [Option<SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 4]>>; 256] =
-            std::array::from_fn(|_| None);
-
-        for tagged in nodes {
-            let tree_idx = tagged.tree_idx;
-            for (byte, child) in tagged.node.into_children() {
-                let slot = &mut slots[byte as usize];
-                let group = slot.get_or_insert_with(SmallVec::new);
-                group.push(TaggedNode {
-                    node: child,
-                    tree_idx,
-                });
-            }
-        }
+        // Pair each node's child iterator with its tree_idx.
+        let mut iters: SmallVec<[_; 4]> = nodes
+            .into_iter()
+            .map(|tagged| (tagged.node.into_children().peekable(), tagged.tree_idx))
+            .collect();
 
         let mut result = Vec::new();
-        for (byte, slot) in slots.into_iter().enumerate() {
-            if let Some(group) = slot {
-                let max_tree_idx = group.iter().map(|t| t.tree_idx).max().unwrap();
-                let child = if group.len() == 1 {
-                    group.into_iter().next().unwrap().node
-                } else {
-                    Self::merge_n_nodes_with(group, f)
-                };
-                result.push((byte as u8, child, max_tree_idx));
+
+        loop {
+            // Find the minimum byte across all non-exhausted iterators.
+            let min_byte = iters
+                .iter_mut()
+                .filter_map(|(iter, _)| iter.peek().map(|(b, _)| *b))
+                .min();
+
+            let Some(current_byte) = min_byte else {
+                break;
+            };
+
+            // Collect all children at current_byte from any iterator that has it.
+            let mut children: SmallVec<[TaggedNode<_, _>; 4]> = SmallVec::new();
+            for (iter, tree_idx) in &mut iters {
+                if iter.peek().map(|(b, _)| *b) == Some(current_byte) {
+                    let (_, child) = iter.next().unwrap();
+                    children.push(TaggedNode {
+                        node: child,
+                        tree_idx: *tree_idx,
+                    });
+                }
             }
+
+            let max_tree_idx = children.iter().map(|t| t.tree_idx).max().unwrap();
+            let merged_child = if children.len() == 1 {
+                children.into_iter().next().unwrap().node
+            } else {
+                Self::merge_n_nodes_with(children, f)
+            };
+
+            result.push((current_byte, merged_child, max_tree_idx));
         }
 
         result
