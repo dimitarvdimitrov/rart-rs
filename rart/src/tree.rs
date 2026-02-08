@@ -3,8 +3,8 @@
 //! This module contains the main [`AdaptiveRadixTree`] implementation and related
 //! functionality for the RART crate.
 
-use std::cmp::{Ordering, min};
-use std::collections::BTreeMap;
+use std::cmp::{Ordering, Reverse, min};
+use std::collections::{BTreeMap, BinaryHeap};
 use std::ops::RangeBounds;
 
 use smallvec::SmallVec;
@@ -726,9 +726,11 @@ where
 
     /// Merge children from N inner nodes with a conflict resolver.
     ///
-    /// Uses streaming N-way merge-join over peekable iterators. All child
-    /// iterators yield `(byte, child)` pairs in sorted byte order, so we can
-    /// advance them in lockstep and collect children sharing the same byte.
+    /// Uses a min-heap for N-way merge-join. Each heap entry tracks the current
+    /// byte from an iterator, allowing O(log N) extraction of the minimum byte
+    /// instead of O(N) linear scan. All child iterators yield `(byte, child)`
+    /// pairs in sorted byte order, so we advance them in lockstep and collect
+    /// children sharing the same byte.
     fn merge_n_children_with<F>(
         nodes: SmallVec<[TaggedNode<KeyType::PartialType, ValueType>; 16]>,
         f: &mut F,
@@ -737,41 +739,42 @@ where
         F: FnMut(ValueType, ValueType) -> ValueType,
     {
         // Pair each node's child iterator with its tree_idx.
-        let mut iters: SmallVec<[_; 4]> = nodes
+        let mut iters: Vec<_> = nodes
             .into_iter()
             .map(|tagged| (tagged.node.into_children().peekable(), tagged.tree_idx))
             .collect();
 
+        // Initialize min-heap with first element from each iterator.
+        // Heap entries: (Reverse(byte), iter_index, tree_idx).
+        let mut heap: BinaryHeap<(Reverse<u8>, usize, usize)> = BinaryHeap::new();
+        for (idx, (iter, tree_idx)) in iters.iter_mut().enumerate() {
+            if let Some((byte, _)) = iter.peek() {
+                heap.push((Reverse(*byte), idx, *tree_idx));
+            }
+        }
+
         let mut result = Vec::new();
 
-        loop {
-            // Find the minimum byte across all non-exhausted iterators.
-            let min_byte = iters
-                .iter_mut()
-                .filter_map(|(iter, _)| iter.peek().map(|(b, _)| *b))
-                .min();
+        while let Some((Reverse(current_byte), _, _)) = heap.peek().copied() {
+            // Collect all children at current_byte.
+            let mut children: SmallVec<[TaggedNode<_, _>; 16]> = SmallVec::new();
 
-            let Some(current_byte) = min_byte else {
-                break;
-            };
-
-            // Count children at current_byte first.
-            let mut count = 0;
-            for (iter, _) in &mut iters {
-                if iter.peek().map(|(b, _)| *b) == Some(current_byte) {
-                    count += 1;
+            while let Some(&(Reverse(byte), idx, tree_idx)) = heap.peek() {
+                if byte != current_byte {
+                    break;
                 }
-            }
+                heap.pop();
 
-            // Collect children with pre-allocated capacity.
-            let mut children: SmallVec<[TaggedNode<_, _>; 16]> = SmallVec::with_capacity(count);
-            for (iter, tree_idx) in &mut iters {
-                if iter.peek().map(|(b, _)| *b) == Some(current_byte) {
-                    let (_, child) = iter.next().unwrap();
-                    children.push(TaggedNode {
-                        node: child,
-                        tree_idx: *tree_idx,
-                    });
+                // Take the child from the iterator.
+                let (_, child) = iters[idx].0.next().unwrap();
+                children.push(TaggedNode {
+                    node: child,
+                    tree_idx,
+                });
+
+                // Push next element from this iterator if available.
+                if let Some((next_byte, _)) = iters[idx].0.peek() {
+                    heap.push((Reverse(*next_byte), idx, iters[idx].1));
                 }
             }
 
@@ -779,6 +782,9 @@ where
             let merged_child = if children.len() == 1 {
                 children.into_iter().next().unwrap().node
             } else {
+                // Sort by tree_idx to ensure fold order matches original tree order.
+                // The resolver expects (left, right) where right comes from a later tree.
+                children.sort_by_key(|t| t.tree_idx);
                 Self::merge_n_nodes_with(children, f)
             };
 
