@@ -664,7 +664,7 @@ where
         let (exact_matches, extensions, lcp) = Self::partition_by_lcp(nodes, lcp_len);
 
         // Build result node with prefix = LCP.
-        let capacity = extensions.len() + if exact_matches.is_empty() { 0 } else { 256 };
+        let capacity = extensions.len() + exact_matches.len()/4;
         let mut result = DefaultNode::new_inner_with_capacity(lcp, capacity);
 
         // Track max tree_idx for each extension byte.
